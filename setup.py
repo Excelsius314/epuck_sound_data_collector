@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'epuck_sound_collection_action_server = epuck_sound_data_collector.epuck_sound_data_collector:main'
         ],
     },
 )
