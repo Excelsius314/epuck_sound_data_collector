@@ -3,76 +3,136 @@ from rclpy.action import ActionServer
 from rclpy.node import Node
 from epuck_driver_interfaces.action import CollectSoundData
 
+import numpy as np
 import time
 import threading
+
 from epuck_driver_interfaces.msg import RecordActivation
 from epuck_driver_interfaces.msg import RecordResult
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from std_msgs.msg import Float32
+
 class EpuckSoundDataCollector(Node):
 
     def __init__(self):
         super().__init__('sound_data_collection_action_server')
         self._action_servers = ActionServer(self, CollectSoundData, 'sound_data_collection', self.execute_goal_callback)
 
-        #self.robot_ids = [0, 1, 2]
-        #self.num_microphones = 4
-
         self.data_cb_group = MutuallyExclusiveCallbackGroup()
-        
-        self.record_activation_publisher = self.create_publisher(RecordActivation, "audio_collection_activation", 1)
-        self.record_result_subscriver = self.create_subscription(RecordResult, "record_result", 
-                                                                 self.record_result_received, 1, 
-                                                                 callback_group=self.data_cb_group)
 
-        self.collected_sound_data = []
+        self.robot_ids  = self.declare_parameter("robot_names", ["epuck1", "epuck2", "epuck3"]).get_parameter_value().string_array_value
+        self.num_microphones = self.declare_parameter("num_microphones", 3).get_parameter_value().integer_value
+
+        self.microphone_buffers = {id:{k:[] for k in range(self.num_microphones)} for id in self.robot_ids}
+        self.microphone_data_subscribers = [[self.create_subscription(Float32, 
+                                                                      "{}/microphone_{}".format(id, k), 
+                                                                      self.create_microphone_data_callback(id, k), 5, callback_group=self.data_cb_group) for k in range(self.num_microphones)] for id in self.robot_ids]
         self.sound_collection_done = threading.Event()
-        self.declare_parameter('average_mic_amplitudes_per_robot', True)
+        self.record = False
 
-
-    def record_result_received(self, result_msg):
+    def record_done_callback(self):
 
         print("Received")
-        self.collected_sound_data = result_msg.averaged_audio_levels
+        self.record = False
+
+        for robot in self.robot_ids:
+            for i in range(self.num_microphones):
+                if len(self.microphone_buffers[robot][i]) == 0:
+                    self.get_logger().info("No data received from robot {}, microphone {}".format(robot, i))
+
         self.sound_collection_done.set()
         
     def execute_goal_callback(self, goal_handle):
 
+
+        recording_time = goal_handle.request.recording_time
+        average_over_robot_mics = goal_handle.request.avg_microphone_amplitudes
+
+
         self.sound_collection_done.clear()
+        self.clear_buffers()
+        self.record = True
+        timer = self.create_timer(recording_time, self.record_done_callback, callback_group=self.data_cb_group)
 
-        avg_mic_ampls = self.get_parameter('average_mic_amplitudes_per_robot').get_parameter_value().bool_value
-
-        record_activation_msg = RecordActivation()
-        record_activation_msg.recording_time = goal_handle.request.recording_time
-        record_activation_msg.average_over_robot = avg_mic_ampls
-        self.record_activation_publisher.publish(record_activation_msg)
-        
         rate = self.create_rate(10)
 
         while not self.sound_collection_done.is_set():
-            print("Checking")
-            rclpy.spin_once
-            time.sleep(0.1)
+            rate.sleep()
         
-        print("Done: {}".format(self.collected_sound_data))
+        timer.cancel()
+        timer.destroy()
+        collected_sound_data = self.get_formated_data_from_buffer(average_over_robot_mics)
+
+        print("Done: {}".format(collected_sound_data))
 
         goal_handle.succeed()
 
         result = CollectSoundData.Result()
 
-        if avg_mic_ampls:
-            result.avg_dbs_robot_0 = [self.collected_sound_data[0]] # Average dBs of robot 0 over recording time
-            #result.avg_dbs_robot_1 = [self.collected_sound_data[1]] # Average dBs of robot 1 over recording time
-            #result.avg_dbs_robot_2 = [self.collected_sound_data[2]] # Average dBs of robot 2 over recording time
+        if average_over_robot_mics:
+            result.avg_dbs_robot_0 = [collected_sound_data[0]] # Average dBs of robot 0 over recording time
 
-        else:       
-            result.avg_dbs_robot_0 = self.collected_sound_data[0] # Average dBs for microphones of robot 0 over recording time
-            #result.avg_dbs_robot_1 = self.collected_sound_data[1] # Average dBs for microphones of robot 1 over recording time
-            #result.avg_dbs_robot_2 = self.collected_sound_data[2] # Average dBs for microphones of robot 2 over recording time
+            if len(self.robot_ids) > 1:
+                result.avg_dbs_robot_1 = [collected_sound_data[1]] # Average dBs of robot 1 over recording time
+            
+            if len(self.robot_ids) > 2:
+                result.avg_dbs_robot_2 = [collected_sound_data[2]] # Average dBs of robot 2 over recording time
+
+        else:
+            result.avg_dbs_robot_0 = list(collected_sound_data[0]) # Average dBs for microphones of robot 0 over recording time
+
+            if len(self.robot_ids) > 1:
+                result.avg_dbs_robot_1 = list(collected_sound_data[1]) # Average dBs for microphones of robot 1 over recording time
+
+            if len(self.robot_ids) > 2:
+                result.avg_dbs_robot_2 = list(collected_sound_data[2]) # Average dBs for microphones of robot 2 over recording time
 
         return result
         
+    
+    def create_microphone_data_callback(self, robot_id, mic_id):
+         
+        def callback(msg):
+            if self.record:
+                self.microphone_buffers[robot_id][mic_id].append(msg.data)
+        
+        return callback
+    
+    def clear_buffers(self):
+         
+        for id in self.robot_ids:
+            for k in range(self.num_microphones):
+                self.microphone_buffers[id][k].clear()
+    
+    def get_formated_data_from_buffer(self, average_over_robot_mics):
 
+        robot_audio_data = []
+        min_len = 10*4
+
+        #for i, id in enumerate(self.robot_ids):
+
+        #    robot_audio_data.append([])
+        #    for k in range(self.num_microphones):
+                
+        #        mic_data = self.microphone_buffers[id][k]
+        #        if len(mic_data) == 0:
+        #            continue
+
+        #        robot_audio_data[i].append(mic_data)
+        #        min_len = min(min_len, len(mic_data))
+
+        for robot in self.robot_ids:
+            for k in range(self.num_microphones):
+                min_len = min(min_len, len(self.microphone_buffers[robot][k]))
+        
+
+        robot_audio_data = np.array([[self.microphone_buffers[robot][k][:min_len] for k in range(self.num_microphones)] for robot in self.robot_ids])
+        avg_axis = (1, 2) if average_over_robot_mics else 2
+        averaged_result = np.average(robot_audio_data, axis=avg_axis)
+
+        print("Averaged Result {}; average over robot: {}".format(averaged_result, average_over_robot_mics))
+        return averaged_result
 
     
     
